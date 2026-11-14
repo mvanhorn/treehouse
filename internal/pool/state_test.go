@@ -2,6 +2,7 @@ package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,7 +28,50 @@ func TestWriteState_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestReadState_LoadsPreIdentityLease(t *testing.T) {
+func TestReadState_RecoversWorktreeMissingFromValidState(t *testing.T) {
+	poolDir := t.TempDir()
+	missingPath := makeFakeWorktree(t, poolDir, "1", "myrepo")
+	if err := WriteState(poolDir, State{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Worktrees) != 1 {
+		t.Fatalf("ReadState returned %d entries, want recovered worktree", len(got.Worktrees))
+	}
+	entry := got.Worktrees[0]
+	if entry.Path != missingPath || !entry.Leased || entry.LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("missing worktree was not conservatively recovered: %#v", entry)
+	}
+}
+
+func TestReadState_RecoversJJWorktreeMissingFromValidState(t *testing.T) {
+	poolDir := t.TempDir()
+	missingPath := makeFakeJJWorktree(t, poolDir, "1", "myrepo")
+	if err := WriteState(poolDir, State{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Worktrees) != 1 {
+		t.Fatalf("ReadState returned %d entries, want recovered jj worktree", len(got.Worktrees))
+	}
+	entry := got.Worktrees[0]
+	if entry.Path != missingPath || !entry.Leased || entry.LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("missing jj worktree was not conservatively recovered: %#v", entry)
+	}
+}
+
+// TestReadState_AdoptsPreIntegrityLease covers unversioned state with no state
+// key, which only a pre-3.0 release writes. Those releases never seeded
+// ignored files, so the lease is adopted with a known, empty inventory.
+func TestReadState_AdoptsPreIntegrityLease(t *testing.T) {
 	poolDir := t.TempDir()
 	stateJSON := `{
   "worktrees": [{
@@ -51,8 +95,136 @@ func TestReadState_LoadsPreIdentityLease(t *testing.T) {
 		t.Fatalf("ReadState returned %d entries, want 1", len(state.Worktrees))
 	}
 	lease := state.Worktrees[0]
-	if !lease.Leased || lease.LeaseID != "" || lease.LeaseHolder != "legacy-automation" || lease.LeasedAt.IsZero() {
-		t.Fatalf("pre-identity lease loaded incorrectly: %#v", lease)
+	if !lease.Leased || !lease.SeedInventoryKnown || len(lease.SeededPaths) != 0 || lease.LeaseHolder != "legacy-automation" {
+		t.Fatalf("pre-integrity lease was not adopted: %#v", lease)
+	}
+}
+
+func TestReadState_QuarantinesCurrentStateWithMissingSeedInventory(t *testing.T) {
+	poolDir := t.TempDir()
+	worktreePath := makeFakeWorktree(t, poolDir, "1", "myrepo")
+	stateJSON := fmt.Sprintf(`{
+  "version": %d,
+  "worktrees": [{
+    "name": "1",
+    "path": %q,
+    "created_at": "2026-07-20T12:00:00Z"
+  }]
+}`, 1, worktreePath)
+	if err := os.WriteFile(stateFilePath(poolDir), []byte(stateJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := state.Worktrees[0]
+	if !entry.Leased || entry.SeedInventoryKnown || entry.LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("missing current inventory was not quarantined: %#v", entry)
+	}
+}
+
+func TestReadState_RecoversInvalidSeedInventory(t *testing.T) {
+	poolDir := t.TempDir()
+	worktreePath := makeFakeWorktree(t, poolDir, "1", "myrepo")
+	stateJSON := fmt.Sprintf(`{
+  "version": %d,
+  "worktrees": [{
+    "name": "1",
+    "path": %q,
+    "created_at": "2026-07-20T12:00:00Z",
+    "seeded_paths": [".git"],
+    "seed_inventory_known": true
+  }]
+}`, 1, worktreePath)
+	if err := os.WriteFile(stateFilePath(poolDir), []byte(stateJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := state.Worktrees[0]
+	if !entry.Leased || entry.SeedInventoryKnown || entry.LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("invalid inventory was not conservatively recovered: %#v", entry)
+	}
+	if _, err := os.Stat(filepath.Join(worktreePath, ".git")); err != nil {
+		t.Fatalf("invalid inventory damaged worktree marker: %v", err)
+	}
+}
+
+func TestReadState_QuarantinesInventoryWithoutValidDigest(t *testing.T) {
+	poolDir := t.TempDir()
+	worktreePath := makeFakeWorktree(t, poolDir, "1", "myrepo")
+	if err := WriteState(poolDir, State{}); err != nil {
+		t.Fatal(err)
+	}
+	forgedDigest := seedInventoryDigest(nil, WorktreeEntry{Name: "1", Path: worktreePath, SeededPaths: []string{"ignored-user-file"}})
+	stateJSON := fmt.Sprintf(`{
+  "version": 3,
+  "worktrees": [{
+    "name": "1",
+    "path": %q,
+    "created_at": "2026-07-20T12:00:00Z",
+    "seeded_paths": ["ignored-user-file"],
+    "seed_inventory_known": true,
+    "seed_inventory_digest": %q
+  }]
+}`, worktreePath, forgedDigest)
+	if err := os.WriteFile(stateFilePath(poolDir), []byte(stateJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := state.Worktrees[0]
+	if !entry.Leased || entry.SeedInventoryKnown || entry.LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("unverified inventory was not quarantined: %#v", entry)
+	}
+}
+
+func TestReadState_QuarantinesInventoryMovedBetweenWorktrees(t *testing.T) {
+	poolDir := t.TempDir()
+	firstPath := makeFakeWorktree(t, poolDir, "1", "myrepo")
+	secondPath := makeFakeWorktree(t, poolDir, "2", "myrepo")
+	state := State{Worktrees: []WorktreeEntry{
+		{Name: "1", Path: firstPath, SeededPaths: []string{"first-secret"}, SeedInventoryKnown: true},
+		{Name: "2", Path: secondPath, SeededPaths: []string{"second-secret"}, SeedInventoryKnown: true},
+	}}
+	if err := WriteState(poolDir, state); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(stateFilePath(poolDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted State
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	persisted.Worktrees[0].SeededPaths, persisted.Worktrees[1].SeededPaths = persisted.Worktrees[1].SeededPaths, persisted.Worktrees[0].SeededPaths
+	persisted.Worktrees[0].SeedInventoryDigest, persisted.Worktrees[1].SeedInventoryDigest = persisted.Worktrees[1].SeedInventoryDigest, persisted.Worktrees[0].SeedInventoryDigest
+	data, err = json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFilePath(poolDir), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range got.Worktrees {
+		if !entry.Leased || entry.SeedInventoryKnown || entry.LeaseHolder != RecoveredLeaseHolder {
+			t.Fatalf("moved inventory was not quarantined: %#v", entry)
+		}
 	}
 }
 
@@ -70,9 +242,27 @@ func TestWriteState_LeavesNoTempFileBehind(t *testing.T) {
 		t.Fatalf("ReadDir: %v", err)
 	}
 	for _, e := range entries {
-		if e.Name() != "treehouse-state.json" {
+		if e.Name() != "treehouse-state.json" && e.Name() != "treehouse-state.key" {
 			t.Fatalf("unexpected leftover file %q in pool dir", e.Name())
 		}
+	}
+}
+
+func TestWriteState_ReplacesInvalidKeyForUnknownInventories(t *testing.T) {
+	poolDir := t.TempDir()
+	if err := os.WriteFile(stateKeyPath(poolDir), []byte("invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := State{Worktrees: []WorktreeEntry{{Name: "1", Path: "unknown"}}}
+	if err := WriteState(poolDir, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Worktrees) != 1 || got.Worktrees[0].SeedInventoryKnown {
+		t.Fatalf("unknown inventory was not preserved safely: %#v", got.Worktrees)
 	}
 }
 
@@ -147,9 +337,25 @@ func TestReadState_RecoversFromEmptyFile(t *testing.T) {
 		if !wt.Leased {
 			t.Errorf("recovered worktree %s not marked leased", wt.Path)
 		}
-		if wt.LeaseHolder != recoveredLeaseHolder {
-			t.Errorf("recovered worktree %s has lease holder %q, want %q", wt.Path, wt.LeaseHolder, recoveredLeaseHolder)
+		if wt.LeaseHolder != RecoveredLeaseHolder {
+			t.Errorf("recovered worktree %s has lease holder %q, want %q", wt.Path, wt.LeaseHolder, RecoveredLeaseHolder)
 		}
+	}
+}
+
+func TestReadState_RecoversJJWorktreeFromEmptyFile(t *testing.T) {
+	poolDir := t.TempDir()
+	wtPath := makeFakeJJWorktree(t, poolDir, "1", "myrepo")
+	if err := os.WriteFile(stateFilePath(poolDir), nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatalf("ReadState on empty file returned error: %v", err)
+	}
+	if len(got.Worktrees) != 1 || got.Worktrees[0].Path != wtPath || !got.Worktrees[0].Leased {
+		t.Fatalf("recovered state = %+v, want jj worktree marked leased", got.Worktrees)
 	}
 }
 
@@ -195,16 +401,16 @@ func TestReadState_RecoveredWorktreesBlockAcquire(t *testing.T) {
 		t.Fatalf("truncate state file: %v", err)
 	}
 
-	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
-		t.Fatal("Acquire after state corruption should refuse to hand out the pool's only worktree, got nil error")
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err != nil {
+		t.Fatalf("Acquire should auto-free the provably safe recovered slot: %v", err)
 	}
 
 	state, err := ReadState(poolDir)
 	if err != nil {
 		t.Fatalf("ReadState: %v", err)
 	}
-	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased {
-		t.Fatalf("state after recovery = %+v, want the recovered worktree marked leased", state.Worktrees)
+	if len(state.Worktrees) != 1 || state.Worktrees[0].Leased || state.Worktrees[0].OwnerPID == 0 {
+		t.Fatalf("state after auto-recovery/acquire = %+v, want the slot acquired by this run", state.Worktrees)
 	}
 }
 
@@ -214,8 +420,21 @@ func makeFakeWorktree(t *testing.T, poolDir, slot, repoName string) string {
 	if err := os.MkdirAll(wtPath, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(wtPath, ".git"), []byte("gitdir: ../../fake.git\n"), 0644); err != nil {
+	registration := t.TempDir()
+	if err := os.WriteFile(filepath.Join(registration, "gitdir"), []byte(filepath.Join(wtPath, ".git")+"\n"), 0644); err != nil {
+		t.Fatalf("WriteFile gitdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, ".git"), []byte("gitdir: "+registration+"\n"), 0644); err != nil {
 		t.Fatalf("WriteFile .git: %v", err)
+	}
+	return wtPath
+}
+
+func makeFakeJJWorktree(t *testing.T, poolDir, slot, repoName string) string {
+	t.Helper()
+	wtPath := filepath.Join(poolDir, slot, repoName)
+	if err := os.MkdirAll(filepath.Join(wtPath, ".jj"), 0755); err != nil {
+		t.Fatalf("MkdirAll .jj: %v", err)
 	}
 	return wtPath
 }
